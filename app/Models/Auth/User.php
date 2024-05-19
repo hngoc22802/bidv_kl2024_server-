@@ -29,7 +29,8 @@ class User extends Authenticatable
         'password',
         'user_name',
         'active',
-        'face_id'
+        'face_id',
+        'count_false',
     ];
 
     /**
@@ -41,7 +42,8 @@ class User extends Authenticatable
         'password',
         'remember_token',
         'face_id',
-        'email'
+        'email',
+        'count_false'
     ];
 
     /**
@@ -60,5 +62,14 @@ class User extends Authenticatable
     public function partner()
     {
         return $this->hasOne(Partner::class, 'user_id');
+    }
+    protected static function booted()
+    {
+        static::updating(function ($user) {
+            // nếu count_false> 3 thì cập nhật lại trạng thái của tài khoản thành false (bị khoá)
+            if ($user->count_false >= 3) {
+                $user->active = false;
+            }
+        });
     }
 }

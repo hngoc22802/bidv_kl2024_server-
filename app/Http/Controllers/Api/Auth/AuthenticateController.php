@@ -13,6 +13,7 @@ use App\Models\EmailOtp;
 use App\Models\Auth\PinCode;
 use App\Models\Auth\User;
 use App\Traits\ResponseType;
+use Crypt;
 use DB;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -38,28 +39,41 @@ class AuthenticateController extends Controller
      *
      * @return \Illuminate\Http\JsonResponse
      */
-// Dang ky tai khoan:
     public function createUser(Request $request)
     {
-        DB::beginTransaction(); 
+        DB::beginTransaction();
+
+        // lấy dữ unicode tự định nghĩa từ constain
         $value = UniCode::encode;
-        $email_arr = str_split($request->get('email'));
+
+        // Lấy dữ liệu email request từ client gửi xuống
+        $email = $request->get('email');
+
+        // cắt string thành mảng
+        $email_arr = str_split($email);
+
+        // chuyển email sang dạng unicode
         $arr_encode = [];
         foreach ($email_arr as $item) {
             $arr_encode[] = $value[$item];
         }
-
+        $email_encode = implode("", $arr_encode);
         try {
+            // tạo user mới
             $user = User::create([
-                'email' => implode("", $arr_encode),
+                'email' => $email_encode,
                 'password' => $request->get('password'),
                 'face_id' => $request->get('face_id') || null
             ]);
-            if ($request->has('pin')) {
-                PinCode::create(['code' => $request->get('pin'), 'user_id' => $user->id]);
+            // Tạo mã pin theo user nếu có gửi xuống
+            if ($request->has('pin_code')) {
+                PinCode::create(['code' => $request->get('pin_code'), 'user_id' => $user->id]);
             }
+            // Tạo dữ liệu tài khoản thẻ
             $code = mt_rand(1000000000000, 9999999999999);
             BankCard::create(['mount' => '100000000', 'limit' => '50000000', 'user_id' => $user->id,'code'=>$code]);
+
+            // tạo thông tin bổ sung cho user
             Partner::create([
                 'name' => $request->get('user_name'),
                 'gender' => $request->get('gender'),
@@ -68,6 +82,7 @@ class AuthenticateController extends Controller
                 'user_id' => $user->id,
                 'birth_date'=>$request->get('birth_date')
             ]);
+
             DB::commit();
             return $this->responseSuccess();
         } catch (\Throwable $th) {
@@ -75,14 +90,61 @@ class AuthenticateController extends Controller
             throw $th;
         }
     }
-    public function getInfo(Request $request, $id)
+    public function login(Request $request)
     {
-        $result = User::with(['bankCard','partner'])->find($id);
-        return $this->responseSuccess($result);
+        // lấy thông tin từ request
+        $otp = $request->input('otp_code');
+        $credentials = $request->only('email', 'password');
+
+        // lấy dữ liệu unicode tuwf contains
+        $value = UniCode::encode;
+        // cắt chuỗi
+        $email_arr = str_split($credentials['email']);
+        $arr_encode = [];
+        foreach ($email_arr as $item) {
+            $arr_encode[] = $value[$item];
+        }
+        $email_encode = implode("", $arr_encode);
+        // Tìm user theo email
+        $user = User::where('email', $email_encode)->first();
+
+        // Check sự tồn tại nếu khôg tìm thấy user hoặc sai mật khẩu thì báo lỗi lên client
+        if (!$user || !Hash::check($credentials['password'], $user->password)) {
+            abort(400, 'Tên đăng nhập hoặc mật khẩu không đúng');
+        }
+
+        // Kiểm tra xem OTP có tồn tại và chưa hết hạn không
+        // nếu user có tồn tại thì kiểm tra xem tài khoản đấy còn hoạt động không
+        if(!$user->active){
+            abort(400, 'Tài khoản của bạn đã bị khoá vì nhập sai mã OTP quá 3 lần');
+        }
+        // Tìm mã otp đã được lưu trong db xem có tồn tại và còn hạn không
+        $otpRecord = EmailOtp::where('email', $credentials['email'])
+            ->where('otp_code', $otp)
+            ->where('expired_at', '>', now())
+            ->orderBy('created_at', 'desc')
+            ->first();
+
+        // Nếu mã otp không tồn tại thì do người dùng nhập sai hoặc chậm
+        if (!$otpRecord) {
+            // Cộng dồn số lần nhập sai mã của người dùng
+            $user->count_false += 1;
+            $user->save();
+            abort(400,'Mã OTP không đúng hoặc đã hết hạn');
+        }
+
+        // nếu nhập đúng sẽ tạo token và cho người dùng đăng nhập
+        $token = $user->createToken('login_token');
+        $user->count_false = 0;
+        $user->save();
+
+        return $this->responseSuccess($token->plainTextToken, ['user_id' => $user->id]);
     }
     public function sendOtp(Request $request)
     {
+        // Lấy dữ liệu request
         $credentials = $request->only('email', 'password');
+
         $value = UniCode::encode;
         $email_arr = str_split($credentials['email']);
         $arr_encode = [];
@@ -93,9 +155,11 @@ class AuthenticateController extends Controller
         if (!$user || !Hash::check($credentials['password'], $user->password)) {
             abort(400, 'Tên đăng nhập hoặc mật khẩu không đúng');
         }
-
+        if(!$user->active){
+            abort(400, 'Tài khoản của bạn đã bị khoá');
+        }
         $otp = mt_rand(100000, 999999); // Sinh mã OTP ngẫu nhiên
-        $expiredAt = now()->addSecond(30); // Thời gian hết hạn của OTP
+        $expiredAt = now()->addSecond(60); // Thời gian hết hạn của OTP
         // Lưu OTP vào database
         EmailOtp::create([
             'email' => $credentials['email'],
@@ -108,34 +172,10 @@ class AuthenticateController extends Controller
 
         return response()->json(['message' => 'OTP has been sent']);
     }
-    public function login(Request $request)
+    public function getInfo($id)
     {
-        $otp = $request->input('otp_code');
-        $credentials = $request->only('email', 'password');
-        $value = UniCode::encode;
-        $email_arr = str_split($credentials['email']);
-        $arr_encode = [];
-        foreach ($email_arr as $item) {
-            $arr_encode[] = $value[$item];
-        }
-        $user = User::where('email', implode("", $arr_encode))->first();
-        if (!$user || !Hash::check($credentials['password'], $user->password)) {
-            abort(400, 'Tên đăng nhập hoặc mật khẩu không đúng');
-        }
-        // Kiểm tra xem OTP có tồn tại và chưa hết hạn không
-        $otpRecord = EmailOtp::where('email', $credentials['email'])
-            ->where('otp_code', $otp)
-            ->where('expired_at', '>', now())
-            ->orderBy('created_at', 'desc')
-            ->first();
-
-        if (!$otpRecord) {
-            // Xác thực thành công
-            return response()->json(['message' => 'Mã OTP không đúng hoặc đã hết hạn'], 401);
-        }
-        $token = $user->createToken('login_token');
-
-        return $this->responseSuccess($token->plainTextToken, ['user_id' => $user->id]);
+        $result = User::with(['bankCard','partner'])->find($id);
+        return $this->responseSuccess($result);
     }
     public function logout(Request $request)
     {
